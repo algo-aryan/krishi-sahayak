@@ -1,16 +1,18 @@
-"""
-Translation using AI4Bharat IndicTrans2.
-Handles Indian languages to English and vice versa.
-"""
+# translator.py
 
 import os
 import torch
-from transformers import AutoModelForSeq2SeqLM, AutoTokenizer
-from langdetect import detect, detect_langs, DetectorFactory
 import logging
-import unicodedata
+from transformers import AutoModelForSeq2SeqLM, AutoTokenizer
+from langdetect import detect_langs, DetectorFactory
+import logging
+import google.generativeai as genai
 
-# Try to import IndicProcessor, fallback to manual approach if not available
+# Configure Gemini API key
+genai.configure(api_key="GEMINI_API_KEY")  # 🔁 Replace with your real API key
+
+model = genai.GenerativeModel('gemini-1.5-flash')
+
 try:
     from IndicTransToolkit.processor import IndicProcessor
     INDIC_PROCESSOR_AVAILABLE = True
@@ -21,10 +23,12 @@ except ImportError:
     except ImportError:
         INDIC_PROCESSOR_AVAILABLE = False
 
-DetectorFactory.seed = 0
-
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
+
+DetectorFactory.seed = 0
+DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+logger.info(f"Using device: {DEVICE}")
 
 LANG_MAPPING = {
     "hi": {"ai4bharat": "hin_Deva", "sarvam": "hi-IN"},
@@ -41,209 +45,107 @@ LANG_MAPPING = {
     "en": {"ai4bharat": "eng_Latn", "sarvam": "en-IN"},
 }
 
-SCRIPT_MAPPING = {
-    "hi": "Devanagari",
-    "bn": "Bengali", 
-    "ta": "Tamil",
-    "te": "Telugu",
-    "mr": "Devanagari",
-    "gu": "Gujarati",
-    "kn": "Kannada",
-    "ml": "Malayalam",
-    "pa": "Gurmukhi",
-    "or": "Oriya",
-    "ur": "Arabic",
-    "en": "Latn",
-}
+XX2EN_MODEL = "ai4bharat/indictrans2-indic-en-1B"
+EN2XX_MODEL = "ai4bharat/indictrans2-en-indic-1B"
 
-DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
-logger.info(f"Using device: {DEVICE}")
+xx2en_tokenizer = AutoTokenizer.from_pretrained(XX2EN_MODEL, trust_remote_code=True)
+xx2en_model = AutoModelForSeq2SeqLM.from_pretrained(XX2EN_MODEL, trust_remote_code=True).to(DEVICE)
 
-XX2EN_MODEL_NAME = "ai4bharat/indictrans2-indic-en-1B"
-xx2en_tokenizer = AutoTokenizer.from_pretrained(XX2EN_MODEL_NAME, trust_remote_code=True)
-xx2en_model = AutoModelForSeq2SeqLM.from_pretrained(XX2EN_MODEL_NAME, trust_remote_code=True).to(DEVICE)
+en2xx_tokenizer = AutoTokenizer.from_pretrained(EN2XX_MODEL, trust_remote_code=True)
+en2xx_model = AutoModelForSeq2SeqLM.from_pretrained(EN2XX_MODEL, trust_remote_code=True).to(DEVICE)
 
-EN2XX_MODEL_NAME = "ai4bharat/indictrans2-en-indic-1B"
-en2xx_tokenizer = AutoTokenizer.from_pretrained(EN2XX_MODEL_NAME, trust_remote_code=True)
-en2xx_model = AutoModelForSeq2SeqLM.from_pretrained(EN2XX_MODEL_NAME, trust_remote_code=True).to(DEVICE)
-
-# Initialize IndicProcessor if available
-if INDIC_PROCESSOR_AVAILABLE:
-    ip = IndicProcessor(inference=True)
-    logger.info("IndicProcessor initialized successfully")
+ip = IndicProcessor(inference=True) if INDIC_PROCESSOR_AVAILABLE else None
+if ip:
+    logger.info("IndicProcessor initialized")
 else:
-    ip = None
-    logger.warning("IndicProcessor not available, using manual preprocessing")
+    logger.warning("IndicProcessor not found. Using fallback preprocessing.")
+
 
 def detect_language(text: str) -> str:
     try:
         detections = detect_langs(text)
-        for detection in detections:
-            lang_code = detection.lang
-            if lang_code in LANG_MAPPING and detection.prob > 0.8:
-                logger.info(f"Detected language with high confidence: {lang_code} (prob: {detection.prob})")
-                return lang_code
-        # fallback to most likely detected lang if no high confidence
-        if detections and detections[0].lang in LANG_MAPPING:
-            fallback_lang = detections[0].lang
-            logger.warning(f"No high-confidence detection. Falling back to most likely: {fallback_lang}")
-            return fallback_lang
-        logger.warning("Language detection failed or unsupported language detected, defaulting to 'hi'")
-        return "hi"
+        for det in detections:
+            if det.lang in LANG_MAPPING and det.prob > 0.85:
+                return det.lang
+        for det in detections:
+            if det.lang in LANG_MAPPING:
+                return det.lang
     except Exception as e:
-        logger.error(f"Language detection error: {e}, defaulting to 'hi'")
-        return "hi"
+        logger.warning(f"Language detection failed: {e}")
+    return "hi"  # fallback
+
+
+def safe_generate(model, tokenizer, inputs, max_len=512):
+    with torch.no_grad():
+        outputs = model.generate(
+            **inputs,
+            use_cache=True,
+            min_length=0,
+            max_length=max_len,
+            num_beams=5,
+            num_return_sequences=1,
+        )
+    decoded = tokenizer.batch_decode(outputs, skip_special_tokens=True)[0]
+    if not decoded.strip() or set(decoded.strip()) <= {'.'}:
+        return ""
+    return decoded.strip()
+
 
 def to_english(text: str, source_lang_code: str = None) -> tuple[str, str]:
-    """
-    Translate from Indic to English using proper IndicTrans2 preprocessing.
-    Returns translated text and Sarvam language code.
-    """
     try:
-        # Determine language code
-        if source_lang_code:
-            src_lang = source_lang_code.split('-')[0]
-            if src_lang not in LANG_MAPPING:
-                src_lang = None
-        else:
-            src_lang = None
+        lang = source_lang_code.split("-")[0] if source_lang_code else detect_language(text)
+        ai4_code = LANG_MAPPING.get(lang, LANG_MAPPING["hi"])["ai4bharat"]
+        sarvam_code = LANG_MAPPING.get(lang, LANG_MAPPING["hi"])["sarvam"] or "hi-IN"
 
-        detected_lang = detect_language(text)
-        final_lang = src_lang or detected_lang or "hi"
+        prompt = f"Translate the following text to English:\n\n'{text}'"
 
-        if final_lang not in LANG_MAPPING:
-            final_lang = "hi"
+        import google.generativeai as genai
+        genai.configure(api_key=os.getenv("GEMINI_API_KEY"))
+        model = genai.GenerativeModel("gemini-1.5-flash")
+        response = model.generate_content(prompt)
 
-        ai4_code = LANG_MAPPING[final_lang]["ai4bharat"]
-        sarvam_code = LANG_MAPPING[final_lang].get("sarvam") or "hi-IN"
+        translation = response.text.strip() if response and response.text else ""
 
-        # Use IndicProcessor if available, otherwise manual preprocessing
-        if INDIC_PROCESSOR_AVAILABLE and ip:
-            # Recommended approach using IndicProcessor
-            batch = ip.preprocess_batch(
-                [text],
-                src_lang=ai4_code,
-                tgt_lang="eng_Latn"
-            )
-            inputs = xx2en_tokenizer(
-                batch,
-                truncation=True,
-                padding="longest",
-                return_tensors="pt",
-                return_attention_mask=True,
-            ).to(DEVICE)
-        else:
-            # Manual approach: prefix with language tags
-            tagged_text = f"{ai4_code} eng_Latn {text}"
-            inputs = xx2en_tokenizer(
-                tagged_text,
-                return_tensors="pt",
-                padding=True,
-                truncation=True,
-                max_length=512
-            ).to(DEVICE)
+        if not translation:
+            logger.warning("Empty or invalid translation. Returning fallback.")
+            return text, sarvam_code
 
-        with torch.no_grad():
-            outputs = xx2en_model.generate(
-                **inputs,
-                use_cache=True,
-                min_length=0,
-                max_length=512,
-                num_beams=5,
-                num_return_sequences=1,
-            )
-        
-        # Decode translation
-        if INDIC_PROCESSOR_AVAILABLE and ip:
-            translation = xx2en_tokenizer.batch_decode(
-                outputs, skip_special_tokens=True, clean_up_tokenization_spaces=True
-            )[0]
-            # Post-process with IndicProcessor
-            translations = ip.postprocess_batch([translation], lang="eng_Latn")
-            translation = translations[0] if translations else translation
-        else:
-            translation = xx2en_tokenizer.decode(
-                outputs[0], skip_special_tokens=True, clean_up_tokenization_spaces=True
-            )
-
-        logger.info(f"Translated '{text[:50]}...' to English: '{translation[:50]}...'")
+        logger.info(f"Translated to English: {translation}")
         return translation, sarvam_code
 
     except Exception as e:
-        logger.error(f"Error during to_english translation: {e}. Falling back to original text.")
+        logger.error(f"to_english error: {e}")
         return text, "hi-IN"
 
+
 def from_english(text: str, target_language_code: str) -> str:
-    """
-    Translate from English back to target Indic language.
-    Uses proper IndicTrans2 preprocessing.
-    """
     try:
         ai4_tgt = None
-        # find ai4bharat code for Sarvam language code
         for v in LANG_MAPPING.values():
             if v.get("sarvam") == target_language_code:
                 ai4_tgt = v["ai4bharat"]
                 break
         if not ai4_tgt:
-            ai4_tgt = "hin_Deva"  # default to Hindi
+            ai4_tgt = "hin_Deva"
 
-        # Use IndicProcessor if available, otherwise manual preprocessing
-        if INDIC_PROCESSOR_AVAILABLE and ip:
-            # Recommended approach using IndicProcessor
-            batch = ip.preprocess_batch(
-                [text],
-                src_lang="eng_Latn",
-                tgt_lang=ai4_tgt
-            )
-            inputs = en2xx_tokenizer(
-                batch,
-                truncation=True,
-                padding="longest",
-                return_tensors="pt",
-                return_attention_mask=True,
-            ).to(DEVICE)
+        if ip:
+            batch = ip.preprocess_batch([text], src_lang="eng_Latn", tgt_lang=ai4_tgt)
+            inputs = en2xx_tokenizer(batch, padding=True, return_tensors="pt").to(DEVICE)
         else:
-            # Manual approach: prefix with language tags
-            tagged_text = f"eng_Latn {ai4_tgt} {text}"
-            inputs = en2xx_tokenizer(
-                tagged_text,
-                return_tensors="pt",
-                padding=True,
-                truncation=True,
-                max_length=512
-            ).to(DEVICE)
+            tagged = f"eng_Latn {ai4_tgt} {text}"
+            inputs = en2xx_tokenizer(tagged, return_tensors="pt", padding=True).to(DEVICE)
 
-        with torch.no_grad():
-            outputs = en2xx_model.generate(
-                **inputs,
-                use_cache=True,
-                min_length=0,
-                max_length=256,
-                num_beams=5,
-                num_return_sequences=1,
-            )
-        
-        # Decode translation
-        if INDIC_PROCESSOR_AVAILABLE and ip:
-            translation = en2xx_tokenizer.batch_decode(
-                outputs, skip_special_tokens=True, clean_up_tokenization_spaces=True
-            )[0]
-            # Post-process with IndicProcessor
-            translations = ip.postprocess_batch([translation], lang=ai4_tgt)
-            translation = translations[0] if translations else translation
-        else:
-            translation = en2xx_tokenizer.decode(
-                outputs[0], skip_special_tokens=True, clean_up_tokenization_spaces=True
-            )
+        translation = safe_generate(en2xx_model, en2xx_tokenizer, inputs, max_len=256)
+        if not translation:
+            logger.warning("Empty translation. Returning fallback.")
+            return text
 
-        if not translation.strip() or set(translation.strip()) <= {'.'}:
-            logger.warning("Translation output invalid or just dots, falling back to English text.")
-            translation = text
+        if ip:
+            translation = ip.postprocess_batch([translation], lang=ai4_tgt)[0]
 
-        logger.info(f"Translated from English to {target_language_code}: {translation[:100]}...")
+        logger.info(f"Translated from English to {target_language_code}: {translation}")
         return translation
 
     except Exception as e:
-        logger.error(f"Error during from_english translation: {e}. Returning English text fallback.")
+        logger.error(f"from_english error: {e}")
         return text
