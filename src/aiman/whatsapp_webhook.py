@@ -188,6 +188,12 @@ def whatsapp_webhook():
         return str(resp)
 
 def process_voice_message(sender: str, media_url: str, user_stats: dict) -> str:
+    # Welcome new users
+    if not user_stats.get("is_returning_user", False):
+        welcome_message = llm.generate_quick_response("greeting")
+        send_whatsapp_response(sender, welcome_message)
+        time.sleep(1) # Small delay to ensure message order
+    
     wav_file = None
     try:
         logger.info("Processing voice message...")
@@ -219,7 +225,7 @@ def process_voice_message(sender: str, media_url: str, user_stats: dict) -> str:
         db.save_user_message(sender, regional_text)
         db.save_bot_response(sender, regional_response)
 
-        # 🔧 FIX: Generate audio SYNCHRONOUSLY before sending
+        # Generate audio SYNCHRONOUSLY before sending
         audio_response_file_mp3 = tts.text_to_speech(regional_response, language=stt_lang_code)
         if not audio_response_file_mp3:
             logger.error("TTS generation failed")
@@ -230,11 +236,11 @@ def process_voice_message(sender: str, media_url: str, user_stats: dict) -> str:
             logger.error("MP3 to OGG conversion failed")
             return regional_response
 
-        # 🔧 FIX: Store file mapping BEFORE sending Twilio message
+        # Store file mapping BEFORE sending Twilio message
         filename = os.path.basename(audio_response_file_ogg)
         store_audio_file_safely(filename, audio_response_file_ogg)
         
-        # 🔧 FIX: Verify file exists before sending
+        # Verify file exists before sending
         if os.path.exists(audio_response_file_ogg):
             send_whatsapp_audio(sender, audio_response_file_ogg)
             return None  # audio sent
@@ -293,10 +299,11 @@ def process_text_message(sender: str, message_text: str, user_stats: dict) -> st
         logger.info(f"Processing text message: {message_text}")
 
         # Greeting for new users
-        if not user_stats.get("is_returning_user", False) and any(
+        is_greeting = any(
             greeting in message_text.lower()
             for greeting in ["hi", "hello", "नमस्ते", "हैलो", "hey"]
-        ):
+        )
+        if not user_stats.get("is_returning_user", False) and is_greeting:
             response = llm.generate_quick_response("greeting")
             db.save_user_message(sender, message_text)
             db.save_bot_response(sender, response)
@@ -373,8 +380,7 @@ def send_whatsapp_audio(sender: str, audio_file_path: str):
 
         filename = os.path.basename(audio_file_path)
         
-        # 🔧 FIX: File already stored safely in process_voice_message
-        # No need to store again here
+        # File already stored safely in process_voice_message
         
         audio_url = f"{base_url.rstrip('/')}/audio/{filename}"
 
@@ -384,7 +390,7 @@ def send_whatsapp_audio(sender: str, audio_file_path: str):
         else:
             formatted_number = f"whatsapp:{cleaned_number}"
 
-        # 🔧 FIX: Add small delay to ensure file is fully written
+        # Add small delay to ensure file is fully written
         time.sleep(0.1)
         
         twilio_client.messages.create(
