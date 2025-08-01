@@ -1,0 +1,12 @@
+Flask==3.0.0
+python-dotenv==1.0.0
+requests==2.31.0
+twilio==8.12.0
+pymongo==4.6.1
+google-generativeai==0.3.2
+transformers==4.36.2
+torch==2.1.2
+torchaudio==2.1.2
+indictrans2-ai4bharat==0.1.0       # Replaces indictrans==2.4.0
+ffmpeg-python==0.2.0
+gunicorn==21.2.0
