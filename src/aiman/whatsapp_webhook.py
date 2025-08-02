@@ -11,24 +11,31 @@ from datetime import datetime, timedelta
 import threading
 from collections import defaultdict
 
+
 from aiman.config import (
     TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN, TWILIO_NUMBER,
     FLASK_ENV, FLASK_DEBUG
 )
-from aiman import audio_pipeline, stt, translator, llm, tts, db
+from aiman import audio_pipeline, stt, translator, llm, tts, db, image_pipeline
+
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
+
 app = Flask(__name__)
 app.config['MAX_CONTENT_LENGTH'] = 16 * 1024 * 1024  # 16MB max file size
 
+
 twilio_client = Client(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN)
+
 
 # In-memory store mapping audio filenames to local file paths
 
+
 file_storage_lock = threading.Lock()
 file_storage = {}
+
 
 def store_audio_file_safely(filename: str, filepath: str):
     """Thread-safe way to store audio file mapping"""
@@ -36,10 +43,12 @@ def store_audio_file_safely(filename: str, filepath: str):
         file_storage[filename] = filepath
         logger.info(f"Stored audio file mapping: {filename} -> {filepath}")
 
+
 def get_audio_file_safely(filename: str) -> str:
     """Thread-safe way to get audio file path"""
     with file_storage_lock:
         return file_storage.get(filename)
+
 
 
 def cleanup_file_later(filename: str, delay_sec: int = 120):
@@ -52,6 +61,7 @@ def cleanup_file_later(filename: str, delay_sec: int = 120):
             logger.info(f"Cleaned up temporary audio file: {path}")
         except Exception as e:
             logger.error(f"Failed to clean up audio file {path}: {e}")
+
 
 @app.route("/audio/<filename>", methods=["GET"])
 def serve_audio(filename):
@@ -107,6 +117,7 @@ def serve_audio(filename):
         
         return response
 
+
 def parse_range_header(range_header, file_size):
     """Parse HTTP Range header and return start, end byte positions"""
     try:
@@ -145,6 +156,7 @@ def parse_range_header(range_header, file_size):
 
 
 
+
 @app.route("/", methods=["GET"])
 def health_check():
     return {
@@ -152,6 +164,7 @@ def health_check():
         "service": "AI Manthan Agricultural Chatbot",
         "version": "1.0.0"
     }
+
 
 @app.route("/whatsapp", methods=["POST"])
 def whatsapp_webhook():
@@ -161,23 +174,31 @@ def whatsapp_webhook():
         media_url = request.values.get("MediaUrl0", "")
         media_content_type = request.values.get("MediaContentType0", "")
 
+
         logger.info(f"Received message from {sender}")
+
 
         user_stats = db.get_user_stats(sender)
 
+
         if media_url and media_content_type.startswith("audio"):
             response_text = process_voice_message(sender, media_url, user_stats)
+        elif media_url and media_content_type.startswith("image"):
+            response_text = process_image_message(sender, media_url, message_text, user_stats)
         elif message_text:
             response_text = process_text_message(sender, message_text, user_stats)
         else:
             response_text = llm.generate_quick_response("greeting")
 
+
         # Only send text if we have a response (voice audio sends separately)
         if response_text:
             send_whatsapp_response(sender, response_text)
 
+
         resp = MessagingResponse()
         return str(resp)
+
 
     except Exception as e:
         logger.error(f"Webhook error: {str(e)}")
@@ -186,6 +207,80 @@ def whatsapp_webhook():
         send_whatsapp_response(sender, error_message)
         resp = MessagingResponse()
         return str(resp)
+
+
+def process_image_message(sender: str, media_url: str, message_text: str, user_stats: dict) -> str:
+    """Process incoming image message and return agricultural analysis"""
+    # Welcome new users
+    if not user_stats.get("is_returning_user", False):
+        welcome_message = llm.generate_quick_response("greeting")
+        send_whatsapp_response(sender, welcome_message)
+        time.sleep(1)  # Small delay to ensure message order
+    
+    image_file = None
+    try:
+        logger.info("Processing image message...")
+        
+        # Download and process the image
+        image_file = image_pipeline.download_and_process_image(media_url)
+        if not image_file:
+            raise RuntimeError("Image download/processing failed")
+        
+        # Validate image format
+        if not image_pipeline.validate_image_format(image_file):
+            return "कृपया एक वैध image format (JPG, PNG, WEBP) में तस्वीर भेजें।"
+        
+        # Get conversation history for context
+        history = db.get_history(sender, limit=3)
+        
+        # Analyze the image with context if available
+        if history:
+            analysis_result = image_pipeline.analyze_image_with_context(
+                image_file, message_text or "इस तस्वीर का विश्लेषण करें", history
+            )
+        else:
+            analysis_result = image_pipeline.analyze_agricultural_image(
+                image_file, message_text or "इस तस्वीर का विश्लेषण करें"
+            )
+        
+        if not analysis_result:
+            return "मुझे इस तस्वीर का विश्लेषण करने में समस्या हुई है। कृपया दूसरी तस्वीर भेजें।"
+        
+        # Detect language from user's text (if any) or use Hindi as default
+        if message_text:
+            detected_lang = "hi-IN"  # Default to Hindi, could enhance with language detection
+            try:
+                # Try to detect language from the text message
+                _, detected_lang = translator.to_english(message_text)
+            except:
+                detected_lang = "hi-IN"
+        else:
+            detected_lang = "hi-IN"
+        
+        # Translate analysis to user's language if not in English
+        if detected_lang != "en-IN":
+            regional_response = image_pipeline.from_english_simple(analysis_result, detected_lang)
+        else:
+            regional_response = analysis_result
+        
+        # Save the interaction to database
+        user_message = f"[Image] {message_text}" if message_text else "[Image sent]"
+        db.save_user_message(sender, user_message)
+        db.save_bot_response(sender, regional_response)
+        
+        logger.info(f"Image analysis completed for {sender}")
+        return regional_response
+        
+    except Exception as e:
+        logger.error(f"Image processing error: {e}")
+        logger.error(traceback.format_exc())
+        return "मुझे इस तस्वीर का विश्लेषण करने में समस्या हुई है। कृपया फिर से कोशिश करें।"
+    
+    finally:
+        # Clean up temporary image file
+        if image_file and os.path.exists(image_file):
+            image_pipeline.cleanup_temp_image(image_file)
+
 
 def process_voice_message(sender: str, media_url: str, user_stats: dict) -> str:
     # Welcome new users
@@ -201,6 +296,7 @@ def process_voice_message(sender: str, media_url: str, user_stats: dict) -> str:
         if not wav_file:
             raise RuntimeError("Audio conversion failed")
 
+
         # Use enhanced transcription with language verification
         transcription = stt.detect_and_transcribe(wav_file)
         
@@ -211,19 +307,25 @@ def process_voice_message(sender: str, media_url: str, user_stats: dict) -> str:
         if not regional_text:
             return llm.generate_quick_response("error")
 
+
         logger.info(f"Enhanced STT result: ({stt_lang_code}, conf: {confidence:.2f}): {regional_text}")
+
 
         # Continue with translation and response generation
         detected_lang_prefix = stt_lang_code.split('-')[0]
         english_text, _ = translator.to_english(regional_text, source_lang_code=detected_lang_prefix)
 
+
         history = db.get_history(sender, limit=3)
         english_response = llm.generate_agricultural_advice(english_text, history)
 
+
         regional_response = translator.from_english(english_response, target_language_code=stt_lang_code)
+
 
         db.save_user_message(sender, regional_text)
         db.save_bot_response(sender, regional_response)
+
 
         # Generate audio SYNCHRONOUSLY before sending
         audio_response_file_mp3 = tts.text_to_speech(regional_response, language=stt_lang_code)
@@ -231,10 +333,12 @@ def process_voice_message(sender: str, media_url: str, user_stats: dict) -> str:
             logger.error("TTS generation failed")
             return regional_response
 
+
         audio_response_file_ogg = convert_mp3_to_ogg(audio_response_file_mp3)
         if not audio_response_file_ogg or not os.path.exists(audio_response_file_ogg):
             logger.error("MP3 to OGG conversion failed")
             return regional_response
+
 
         # Store file mapping BEFORE sending Twilio message
         filename = os.path.basename(audio_response_file_ogg)
@@ -248,13 +352,16 @@ def process_voice_message(sender: str, media_url: str, user_stats: dict) -> str:
             logger.error(f"Audio file does not exist: {audio_response_file_ogg}")
             return regional_response
 
+
     except Exception as e:
         logger.error(f"Voice processing error: {e}")
         return llm.generate_quick_response("error")
 
+
     finally:
         if wav_file and os.path.exists(wav_file):
             audio_pipeline.cleanup_temp_file(wav_file)
+
 
 
 def convert_mp3_to_ogg(mp3_file_path: str) -> str:
@@ -262,6 +369,7 @@ def convert_mp3_to_ogg(mp3_file_path: str) -> str:
     try:
         temp_dir = tempfile.mkdtemp(prefix="tts_ogg_")
         ogg_file_path = os.path.join(temp_dir, "tts_output.ogg")
+
 
         ffmpeg_cmd = [
             "ffmpeg",
@@ -276,10 +384,12 @@ def convert_mp3_to_ogg(mp3_file_path: str) -> str:
             ogg_file_path
         ]
 
+
         result = subprocess.run(ffmpeg_cmd, capture_output=True, text=True)
         if result.returncode != 0:
             logger.error(f"ffmpeg conversion failed: {result.stderr}")
             return mp3_file_path  # fallback to original if failure
+
 
         # Verify the output file exists and has content
         if os.path.exists(ogg_file_path) and os.path.getsize(ogg_file_path) > 0:
@@ -289,14 +399,17 @@ def convert_mp3_to_ogg(mp3_file_path: str) -> str:
             logger.error("OGG conversion produced empty file")
             return mp3_file_path
 
+
     except Exception as e:
         logger.error(f"Error in converting MP3 to OGG: {e}")
         return mp3_file_path
 
 
+
 def process_text_message(sender: str, message_text: str, user_stats: dict) -> str:
     try:
         logger.info(f"Processing text message: {message_text}")
+
 
         # Greeting for new users
         is_greeting = any(
@@ -309,6 +422,7 @@ def process_text_message(sender: str, message_text: str, user_stats: dict) -> st
             db.save_bot_response(sender, response)
             return response
 
+
         # Translation flow for general text
         english_text, detected_language = translator.to_english(message_text)
         history = db.get_history(sender, limit=3)
@@ -318,20 +432,25 @@ def process_text_message(sender: str, message_text: str, user_stats: dict) -> st
             target_language_code=detected_language
         )
 
+
         db.save_user_message(sender, message_text)
         db.save_bot_response(sender, regional_response)
 
+
         return regional_response
+
 
     except Exception as e:
         logger.error(f"Text processing error: {str(e)}")
         logger.error(traceback.format_exc())
         return llm.generate_quick_response("error")
 
+
 def send_whatsapp_response(sender: str, message: str):
     try:
         if not message:
             return
+
 
         cleaned_number = sender.replace("whatsapp:", "").replace(" ", "")
         if not cleaned_number.startswith("+"):
@@ -339,12 +458,15 @@ def send_whatsapp_response(sender: str, message: str):
         else:
             formatted_number = f"whatsapp:{cleaned_number}"
 
+
         MAX_MESSAGE_LENGTH = 1600
+
 
         # Split message intelligently at spaces to avoid breaking words
         message_chunks = []
         start = 0
         text_length = len(message)
+
 
         while start < text_length:
             end = min(start + MAX_MESSAGE_LENGTH, text_length)
@@ -357,6 +479,7 @@ def send_whatsapp_response(sender: str, message: str):
                 message_chunks.append(chunk)
             start = end
 
+
         for chunk in message_chunks:
             twilio_client.messages.create(
                 from_=TWILIO_NUMBER,
@@ -365,9 +488,11 @@ def send_whatsapp_response(sender: str, message: str):
             )
         logger.info(f"Sent {len(message_chunks)} text message chunk(s) to {sender}")
 
+
     except Exception as e:
         logger.error(f"Failed to send WhatsApp response: {str(e)}")
         logger.error(traceback.format_exc())
+
 
 def send_whatsapp_audio(sender: str, audio_file_path: str):
     try:
@@ -378,17 +503,20 @@ def send_whatsapp_audio(sender: str, audio_file_path: str):
             send_whatsapp_response(sender, "🎵 ऑडियो जवाब उपलब्ध नहीं है। कृपया कुछ समय बाद पुनः प्रयास करें।")
             return
 
+
         filename = os.path.basename(audio_file_path)
         
         # File already stored safely in process_voice_message
         
         audio_url = f"{base_url.rstrip('/')}/audio/{filename}"
 
+
         cleaned_number = sender.replace("whatsapp:", "").replace(" ", "")
         if not cleaned_number.startswith("+"):
             formatted_number = f"whatsapp:+91{cleaned_number}"
         else:
             formatted_number = f"whatsapp:{cleaned_number}"
+
 
         # Add small delay to ensure file is fully written
         time.sleep(0.1)
@@ -400,15 +528,18 @@ def send_whatsapp_audio(sender: str, audio_file_path: str):
         )
         logger.info(f"Sent audio message with media URL {audio_url} to {sender}")
 
+
         # Cleanup audio file asynchronously after 2 minutes
         cleanup_thread = threading.Thread(target=cleanup_file_later, args=(filename, 120))
         cleanup_thread.start()
+
 
     except Exception as e:
         logger.error(f"Failed to send WhatsApp audio: {str(e)}")
         logger.error(traceback.format_exc())
         # Fallback to text if audio send fails
         send_whatsapp_response(sender, "🎵 यहाँ आपका ऑडियो जवाब होगा")
+
 
 
 @app.route("/stats", methods=["GET"])
@@ -425,6 +556,7 @@ def get_stats():
         logger.error(f"Stats endpoint error: {str(e)}")
         logger.error(traceback.format_exc())
         return {"error": str(e)}, 500
+
 
 if __name__ == "__main__":
     logger.info("🚀 Starting AI Manthan Agricultural Chatbot...")
