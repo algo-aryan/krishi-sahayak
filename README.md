@@ -208,7 +208,7 @@ Reply to him in <original_language> like a friendly agriculture expert.
 
 ## 📄 License
 
-This project is licensed under the **MIT License**. See `LICENSE` for details.
+This project is licensed under the **MIT License**.
 
 ---
 
@@ -217,6 +217,6 @@ This project is licensed under the **MIT License**. See `LICENSE` for details.
 Made with ❤️ for Bharat Kisan by:
 
 - **Aryan Bansal** ([@algo-aryan](https://github.com/algo-aryan))
-- **Arnav Bansal** ([@algo-aryan](https://github.com/algo-aryan))
-- **Arnsh Goel** ([@algo-aryan](https://github.com/algo-aryan))
-- **Arnav Goyal** ([@algo-aryan](https://github.com/algo-aryan))
+- **Arnav Bansal** ([@Krypto-Knight-05](https://github.com/Krypto-Knight-05))
+- **Arnsh Goel** ([@AnshGoel-hub](https://github.com/AnshGoel-hub))
+- **Arnav Goyal** ([@Bluechamp003](https://github.com/Bluechamp003))
