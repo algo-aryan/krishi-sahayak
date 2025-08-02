@@ -218,5 +218,5 @@ Made with ❤️ for Bharat Kisan by:
 
 - **Aryan Bansal** ([@algo-aryan](https://github.com/algo-aryan))
 - **Arnav Bansal** ([@Krypto-Knight-05](https://github.com/Krypto-Knight-05))
-- **Arnsh Goel** ([@AnshGoel-hub](https://github.com/AnshGoel-hub))
+- **Ansh Goel** ([@AnshGoel-hub](https://github.com/AnshGoel-hub))
 - **Arnav Goyal** ([@Bluechamp003](https://github.com/Bluechamp003))
